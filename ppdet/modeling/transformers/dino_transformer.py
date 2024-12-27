@@ -476,11 +476,14 @@ class DINOTransformer(nn.Layer):
         valid_ratios = []
         for i, feat in enumerate(proj_feats):
             bs, _, h, w = paddle.shape(feat)
+            h = paddle.unsqueeze(h, axis = 0)
+            w = paddle.unsqueeze(w, axis = 0)
             spatial_shapes.append(paddle.concat([h, w]))
             # [b,c,h,w] -> [b,h*w,c]
             feat_flatten.append(feat.flatten(2).transpose([0, 2, 1]))
             if pad_mask is not None:
-                mask = F.interpolate(pad_mask.unsqueeze(0), size=(h, w))[0]
+                #mask = F.interpolate(pad_mask.unsqueeze(0), size=(h, w))[0]
+                mask = F.interpolate(pad_mask.unsqueeze(0), size=(h.item(), w.item()))[0]
             else:
                 mask = paddle.ones([bs, h, w])
             valid_ratios.append(get_valid_ratio(mask))
@@ -569,15 +572,23 @@ class DINOTransformer(nn.Layer):
                                     spatial_shapes,
                                     memory_mask=None,
                                     grid_size=0.05):
+        print(f"Initial memory shape: {memory.shape}")
+        # 显示将spatial_shapes 类型从int64转为int32
+        spatial_shapes = spatial_shapes.astype('int32')
+        print(f" spatial_shapes: {spatial_shapes}")
         output_anchors = []
         idx = 0
         for lvl, (h, w) in enumerate(spatial_shapes):
+            # print(f"Processing level {lvl}, h: {h}, w: {w}")
             if memory_mask is not None:
                 mask_ = memory_mask[:, idx:idx + h * w].reshape([-1, h, w])
+                # print(f"mask_ shape (level {lvl}): {mask_.shape}")
                 valid_H = paddle.sum(mask_[:, :, 0], 1)
                 valid_W = paddle.sum(mask_[:, 0, :], 1)
             else:
                 valid_H, valid_W = h, w
+            # print(f"valid_H (level {lvl}): {valid_H}")
+            # print(f"valid_W (level {lvl}): {valid_W}")
 
             grid_y, grid_x = paddle.meshgrid(
                 paddle.arange(
@@ -585,26 +596,45 @@ class DINOTransformer(nn.Layer):
                 paddle.arange(
                     end=w, dtype=memory.dtype))
             grid_xy = paddle.stack([grid_x, grid_y], -1)
+            # print(f"grid_xy shape (level {lvl}): {grid_xy.shape}")
 
             valid_WH = paddle.stack([valid_W, valid_H], -1).reshape(
                 [-1, 1, 1, 2]).astype(grid_xy.dtype)
+            # 确保 valid_WH 不含 0
+            valid_WH = paddle.where(valid_WH == 0, paddle.to_tensor(1.0, dtype=grid_xy.dtype), valid_WH)
+            # print(f"valid_WH shape (level {lvl}): {valid_WH.shape}")
             grid_xy = (grid_xy.unsqueeze(0) + 0.5) / valid_WH
+            # print(f"Normalized grid_xy shape (level {lvl}): {grid_xy.shape}")
             wh = paddle.ones_like(grid_xy) * grid_size * (2.0**lvl)
-            output_anchors.append(
-                paddle.concat([grid_xy, wh], -1).reshape([-1, h * w, 4]))
+            # print(f"wh shape (level {lvl}): {wh.shape}")
+            # output_anchors.append(
+            #     paddle.concat([grid_xy, wh], -1).reshape([-1, h * w, 4]))
+            concatenated = paddle.concat([grid_xy, wh], -1)
+            print(f"Concatenated shape (level {lvl}): {concatenated.shape}")
+            reshaped = concatenated.reshape([-1, h * w, 4])
+            print(f"Reshaped shape (level {lvl}): {reshaped.shape}")
+            output_anchors.append(reshaped)
+            
             idx += h * w
 
         output_anchors = paddle.concat(output_anchors, 1)
+        # print(f"Final output_anchors shape: {output_anchors.shape}")
         valid_mask = ((output_anchors > self.eps) *
                       (output_anchors < 1 - self.eps)).all(-1, keepdim=True)
+        print(f"valid_mask shape: {valid_mask.shape}")     
         output_anchors = paddle.log(output_anchors / (1 - output_anchors))
+        output_anchors = paddle.clip(output_anchors, min=1e-6, max=1-1e-6)   
         if memory_mask is not None:
-            valid_mask = (valid_mask * (memory_mask.unsqueeze(-1) > 0)) > 0
+            # print(f"memory_mask shape: {memory_mask.shape}")
+            # valid_mask = (valid_mask * (memory_mask.unsqueeze(-1) > 0)) > 0
+            valid_mask = valid_mask & (memory_mask.unsqueeze(-1) > 0)
         output_anchors = paddle.where(valid_mask, output_anchors,
                                       paddle.to_tensor(float("inf")))
 
         memory = paddle.where(valid_mask, memory, paddle.to_tensor(0.))
+        # print(f"memory shape after masking: {memory.shape}")
         output_memory = self.enc_output(memory)
+        print(f"output_memory shape: {output_memory.shape}")
         return output_memory, output_anchors
 
     def _get_decoder_input(self,
